@@ -1,0 +1,29 @@
+// pve-category: auto-reinstall UI hooks after pve-manager overwrites
+// pvemanagerlib.js with a stock copy during an upgrade/reinstall.
+//
+// DPkg::Pre-Install-Pkgs feeds the list of packages in the CURRENT dpkg
+// transaction to a script via stdin (one "name:arch" per line) BEFORE
+// they're unpacked. We use it here only to detect whether pve-manager is
+// part of this transaction -- the actual reinstall happens afterwards, via
+// DPkg::Post-Invoke, once the new pvemanagerlib.js is already on disk.
+//
+// This two-hook split matters: Pre-Install-Pkgs is the only reliable way to
+// see "is pve-manager in this transaction", but it fires before the new
+// file is unpacked, so calling 'pve-category ensure' there would look at
+// the OLD file. Post-Invoke fires after unpacking is complete, which is
+// when we actually want to patch. The helper script writes a flag file to
+// bridge the two.
+//
+// Install:
+//   cp pve-category-apt-check.sh /usr/local/sbin/pve-category-apt-check.sh
+//   chmod 755 /usr/local/sbin/pve-category-apt-check.sh
+//   cp 99-pve-category /etc/apt/apt.conf.d/99-pve-category
+// No further configuration needed after that.
+
+DPkg::Pre-Install-Pkgs {
+    "/usr/local/sbin/pve-category-apt-check.sh --mark";
+};
+
+DPkg::Post-Invoke {
+    "/usr/local/sbin/pve-category-apt-check.sh --run-if-marked";
+};

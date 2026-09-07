@@ -1,0 +1,38 @@
+{
+  "main services": {
+    "order": 1,
+    "icon": "fa fa-server",
+    "ids": [],
+    "ranges": [[100, 199]]
+  },
+  "infrastructure": {
+    "order": 2,
+    "icon": "fa fa-sitemap",
+    "ids": [],
+    "ranges": [[200, 299]]
+  },
+  "monitoring": {
+    "order": 3,
+    "icon": "fa fa-area-chart",
+    "ids": [],
+    "ranges": [[300, 399]]
+  },
+  "development": {
+    "order": 4,
+    "icon": "fa fa-code",
+    "ids": [],
+    "ranges": [[400, 499]]
+  },
+  "database": {
+    "order": 5,
+    "icon": "fa fa-database",
+    "ids": [],
+    "ranges": [[500, 599]]
+  },
+  "experimental": {
+    "order": 6,
+    "icon": "fa fa-flask",
+    "ids": [101, 250],
+    "ranges": [[900, 999]]
+  }
+}

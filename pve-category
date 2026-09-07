@@ -1,0 +1,765 @@
+#!/usr/bin/env python3
+"""
+pve-category — external category config manager for Proxmox VE Server View.
+
+Unofficial community tool. Not affiliated with Proxmox Server Solutions GmbH.
+
+Usage:
+    pve-category install   # one-time: patch pvemanagerlib.js with hooks (safe, backed up)
+    pve-category apply     # read config JSON, regenerate category block, validate, swap
+    pve-category status    # show currently active categories parsed from the live file
+    pve-category rollback  # restore the file to the state before 'install' was ever run
+    pve-category ensure    # idempotent: reinstall hooks only if missing (safe for apt hooks)
+
+Config file: /root/pve-ui-categories.json
+Target file: /usr/share/pve-manager/js/pvemanagerlib.js
+Backups:     /root/pve-ui-backup/
+"""
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+from datetime import datetime
+
+TARGET = "/usr/share/pve-manager/js/pvemanagerlib.js"
+CONFIG = "/root/pve-ui-categories.json"
+BACKUP_DIR = "/root/pve-ui-backup"
+PRISTINE_BACKUP = os.path.join(BACKUP_DIR, "pvemanagerlib.js.pristine-before-install")
+
+BEGIN_CATEGORY_MARKER = "// BEGIN PVE-CATEGORY DATA (auto-generated, edit /root/pve-ui-categories.json instead)"
+END_CATEGORY_MARKER = "// END PVE-CATEGORY DATA"
+
+BEGIN_HOOK_MARKER = "// BEGIN PVE-CATEGORY HOOK"
+END_HOOK_MARKER = "// END PVE-CATEGORY HOOK"
+
+BEGIN_SORT_MARKER = "// BEGIN PVE-CATEGORY SORT HOOK"
+END_SORT_MARKER = "// END PVE-CATEGORY SORT HOOK"
+
+BEGIN_SELECT_MARKER = "// BEGIN PVE-CATEGORY SELECT GUARD (beforeselect)"
+END_SELECT_MARKER = "// END PVE-CATEGORY SELECT GUARD"
+
+DEFAULT_ICON = "fa fa-folder"
+
+
+def ts():
+    return datetime.now().strftime("%Y%m%d-%H%M%S")
+
+
+def die(msg, code=1):
+    print(f"[pve-category] ERROR: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def info(msg):
+    print(f"[pve-category] {msg}")
+
+
+def read_file(path):
+    with open(path, "r", encoding="utf-8") as f:
+        return f.read()
+
+
+def write_file(path, content):
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(content)
+
+
+def backup_current(label):
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    dest = os.path.join(BACKUP_DIR, f"pvemanagerlib.js.{ts()}.{label}")
+    shutil.copy2(TARGET, dest)
+    info(f"Backup created: {dest}")
+    return dest
+
+
+def node_check(path):
+    try:
+        result = subprocess.run(
+            ["node", "--check", path],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except FileNotFoundError:
+        die("`node` binary not found — cannot validate syntax. Aborting for safety.")
+    if result.returncode != 0:
+        return False, result.stderr.strip()
+    return True, ""
+
+
+def restart_pveproxy():
+    result = subprocess.run(
+        ["systemctl", "restart", "pveproxy"],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode != 0:
+        info(f"WARNING: pveproxy restart FAILED: {result.stderr.strip()}")
+        info(
+            "The file was updated successfully, but the web UI won't reflect it until "
+            "pveproxy restarts. Run: systemctl restart pveproxy"
+        )
+        return False
+    info("pveproxy restarted.")
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Config loading & validation
+# ---------------------------------------------------------------------------
+
+def get_known_vmids():
+    """Best-effort list of VMIDs that actually exist in the cluster, via pvesh.
+    Returns None if pvesh is unavailable or fails — callers should treat that
+    as 'unknown' and skip the check rather than block on it."""
+    try:
+        result = subprocess.run(
+            ["pvesh", "get", "/cluster/resources", "--type", "vm", "--output-format", "json"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except FileNotFoundError:
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        resources = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    return {r["vmid"] for r in resources if "vmid" in r}
+
+
+def warn_unknown_vmids(categories):
+    known = get_known_vmids()
+    if known is None:
+        return  # pvesh unavailable or failed — skip silently, not a hard requirement
+    for cat in categories:
+        for vmid in cat["ids"]:
+            if vmid not in known:
+                info(
+                    f"WARNING: VMID {vmid} in category '{cat['name']}' does not currently "
+                    "exist in this cluster (typo, or the guest was removed?)."
+                )
+
+
+def load_config():
+    if not os.path.exists(CONFIG):
+        die(f"Config file not found: {CONFIG}")
+    try:
+        with open(CONFIG, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        die(f"Config JSON is invalid: {e}")
+
+    if "categories" not in data or not isinstance(data["categories"], list):
+        die("Config must have a top-level 'categories' array.")
+
+    seen_names = set()
+    seen_ids = {}
+    seen_orders = {}
+    seen_ranges = []  # list of (lo, hi, category_name) across all categories, for overlap checks
+    for i, cat in enumerate(data["categories"]):
+        for key in ("name", "order"):
+            if key not in cat:
+                die(f"categories[{i}] is missing required key '{key}'")
+        if not isinstance(cat["name"], str) or not cat["name"].strip():
+            die(f"categories[{i}].name must be a non-empty string")
+        if not isinstance(cat["order"], int):
+            die(f"categories[{i}].name='{cat['name']}': order must be an integer")
+
+        has_ids = "ids" in cat
+        has_ranges = "ranges" in cat
+        if not has_ids and not has_ranges:
+            die(f"categories[{i}].name='{cat['name']}': must have 'ids', 'ranges', or both")
+
+        if has_ids:
+            if not isinstance(cat["ids"], list) or not all(isinstance(x, int) for x in cat["ids"]):
+                die(f"categories[{i}].name='{cat['name']}': ids must be a list of integers (VMIDs)")
+        else:
+            cat["ids"] = []
+
+        if has_ranges:
+            if not isinstance(cat["ranges"], list):
+                die(f"categories[{i}].name='{cat['name']}': ranges must be a list of [start, end] pairs")
+            for r in cat["ranges"]:
+                if (
+                    not isinstance(r, list)
+                    or len(r) != 2
+                    or not all(isinstance(x, int) for x in r)
+                ):
+                    die(
+                        f"categories[{i}].name='{cat['name']}': each range must be a [start, end] "
+                        f"pair of integers (got {r!r})"
+                    )
+                if r[0] > r[1]:
+                    die(
+                        f"categories[{i}].name='{cat['name']}': range {r} has start > end"
+                    )
+        else:
+            cat["ranges"] = []
+
+        if not cat["ids"] and not cat["ranges"]:
+            die(f"categories[{i}].name='{cat['name']}': 'ids' and 'ranges' are both empty")
+
+        if "icon" in cat:
+            if not isinstance(cat["icon"], str) or not cat["icon"].strip():
+                die(f"categories[{i}].name='{cat['name']}': icon must be a non-empty string (e.g. 'fa fa-server')")
+
+        name_lower = cat["name"].strip().lower()
+        if name_lower in seen_names:
+            die(f"Duplicate category name (case-insensitive): '{cat['name']}'")
+        seen_names.add(name_lower)
+
+        if cat["order"] in seen_orders:
+            die(
+                f"Duplicate order value {cat['order']}: used by both "
+                f"'{seen_orders[cat['order']]}' and '{cat['name']}'. "
+                "Each category needs a unique order for sorting to be predictable."
+            )
+        seen_orders[cat["order"]] = cat["name"]
+
+        for vmid in cat["ids"]:
+            if vmid in seen_ids:
+                die(
+                    f"VMID {vmid} assigned to both '{seen_ids[vmid]}' and "
+                    f"'{cat['name']}' — a VMID can only belong to one category's explicit ids."
+                )
+            seen_ids[vmid] = cat["name"]
+
+        # Ranges must not overlap with ranges from OTHER categories — with no
+        # explicit id to break the tie, an overlapping range is genuinely
+        # ambiguous. (A VMID appearing in both a range here and another
+        # category's explicit 'ids' is fine on purpose — explicit ids are the
+        # escape hatch for pulling one guest out of its range's default.)
+        for lo, hi in cat["ranges"]:
+            for other_lo, other_hi, other_name in seen_ranges:
+                if lo <= other_hi and other_lo <= hi:
+                    die(
+                        f"Range [{lo}, {hi}] in '{cat['name']}' overlaps range "
+                        f"[{other_lo}, {other_hi}] in '{other_name}' — a VMID falling in "
+                        "both would be ambiguous. Narrow the ranges, or use explicit 'ids' "
+                        "for the exception instead."
+                    )
+            seen_ranges.append((lo, hi, cat["name"]))
+
+    return data["categories"]
+
+
+# ---------------------------------------------------------------------------
+# Code generation
+# ---------------------------------------------------------------------------
+
+def js_string(s):
+    """Safely encode a Python string as a JS string literal."""
+    return json.dumps(s)
+
+
+def generate_category_block(categories):
+    lines = []
+    lines.append(BEGIN_CATEGORY_MARKER)
+    lines.append("const __pveCategories = {")
+    for cat in sorted(categories, key=lambda c: c["order"]):
+        name = js_string(cat["name"])
+        icon = js_string(cat.get("icon", DEFAULT_ICON))
+        ids = ", ".join(str(x) for x in cat.get("ids", []))
+        ranges = ", ".join(f"[{lo}, {hi}]" for lo, hi in cat.get("ranges", []))
+        lines.append(f"    {name}: {{")
+        lines.append(f"        order: {cat['order']},")
+        lines.append(f"        icon: {icon},")
+        lines.append(f"        ids: [{ids}],")
+        lines.append(f"        ranges: [{ranges}],")
+        lines.append("    },")
+    lines.append("};")
+    lines.append(END_CATEGORY_MARKER)
+    return "\n".join(lines)
+
+
+GROUP_CHILD_HOOK_TEMPLATE = """{begin}
+if (groups.length === 1 && groups[0] === 'node' && level === 1) {{
+    let vmid = Number(info.vmid);
+    let categoryName = null;
+    let categoryOrder = 999;
+    let categoryIcon = null;
+
+    if (!Number.isNaN(vmid)) {{
+        // Explicit ids win first — that's how you pull one guest out of a
+        // range's default category (e.g. id 105 out of the 100-199 range).
+        for (const [name, config] of Object.entries(__pveCategories)) {{
+            if (config.ids && config.ids.includes(vmid)) {{
+                categoryName = name;
+                categoryOrder = config.order;
+                categoryIcon = config.icon;
+                break;
+            }}
+        }}
+        // No explicit id match — fall back to range membership, so a newly
+        // created CT/VM lands in the right category automatically just by
+        // its VMID, with no config edit needed.
+        if (!categoryName) {{
+            for (const [name, config] of Object.entries(__pveCategories)) {{
+                if (config.ranges && config.ranges.some(([lo, hi]) => vmid >= lo && vmid <= hi)) {{
+                    categoryName = name;
+                    categoryOrder = config.order;
+                    categoryIcon = config.icon;
+                    break;
+                }}
+            }}
+        }}
+    }}
+
+    if (categoryName) {{
+        let groupId =
+            '/pve-category/' +
+            (node.data.node || node.data.id || 'node') +
+            '/' +
+            categoryName;
+
+        let category = node.findChild('id', groupId, false);
+
+        if (!category) {{
+            category = me.addChildSorted(node, {{
+                type: 'custom-category',
+                id: groupId,
+                text: categoryName,
+                groupbyid: groupId,
+                customCategoryOrder: categoryOrder,
+                leaf: false,
+                expanded: true,
+                iconCls: categoryIcon || '{default_icon}',
+            }});
+            // addChildSorted() overwrites info.text with info.groupbyid (the full
+            // path, e.g. '/pve-category/proxmox/main services') whenever groupbyid
+            // is set — that's the long-folder-name bug. Setting text back on the
+            // record right after creation restores the short category name without
+            // having to remove groupbyid (which other code, e.g. nodeSortFn and the
+            // showSearch check, relies on being present for group-type nodes).
+            category.set('text', categoryName);
+        }}
+
+        return me.addChildSorted(category, info);
+    }}
+}}
+{end}"""
+
+
+def generate_group_child_hook():
+    return GROUP_CHILD_HOOK_TEMPLATE.format(
+        begin=BEGIN_HOOK_MARKER,
+        end=END_HOOK_MARKER,
+        default_icon=DEFAULT_ICON,
+    )
+
+
+SORT_HOOK_TEMPLATE = """{begin}
+if (n1.type === 'custom-category' && n2.type === 'custom-category') {{
+    let o1 = n1.customCategoryOrder ?? 999;
+    let o2 = n2.customCategoryOrder ?? 999;
+    if (o1 !== o2) {{
+        return o1 - o2;
+    }}
+    return (n1.text || '').localeCompare(n2.text || '');
+}}
+{end}"""
+
+
+def generate_sort_hook():
+    return SORT_HOOK_TEMPLATE.format(begin=BEGIN_SORT_MARKER, end=END_SORT_MARKER)
+
+
+SELECT_GUARD_TEMPLATE = """{begin}
+beforeselect: function (sm, record) {{
+    // Block selection entirely for pve-category folder nodes. Returning false
+    // here cancels the selection before it happens — selectionchange never
+    // fires for this node, so setContent() is never called with it, and
+    // nothing ever gets saved as the 'last selected' state (the 'rid' key)
+    // for a category node. This also means expand/collapse still works
+    // (that's a separate itemexpand/itemcollapse event in ExtJS TreePanel,
+    // unaffected by cancelling selection) but clicking the folder text no
+    // longer changes the right-hand panel or the URL hash at all.
+    if (record && record.data && record.data.type === 'custom-category') {{
+        return false;
+    }}
+    return true;
+}},
+{end}"""
+
+
+def generate_select_guard():
+    return SELECT_GUARD_TEMPLATE.format(begin=BEGIN_SELECT_MARKER, end=END_SELECT_MARKER)
+
+
+# ---------------------------------------------------------------------------
+# Install (one-time bootstrap)
+# ---------------------------------------------------------------------------
+
+def cmd_install():
+    if not os.path.exists(TARGET):
+        die(f"Target file not found: {TARGET}")
+
+    content = read_file(TARGET)
+
+    if BEGIN_HOOK_MARKER in content or BEGIN_SORT_MARKER in content or BEGIN_SELECT_MARKER in content:
+        die(
+            "Hooks already present in the target file. "
+            "Run 'pve-category rollback' first if you want to reinstall from scratch."
+        )
+
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    if not os.path.exists(PRISTINE_BACKUP):
+        shutil.copy2(TARGET, PRISTINE_BACKUP)
+        info(f"Pristine (pre-install) backup saved: {PRISTINE_BACKUP}")
+    else:
+        info(f"Pristine backup already exists, not overwriting: {PRISTINE_BACKUP}")
+
+    backup_current("before-install")
+
+    # --- Anchor 1: groupChild ---
+    group_child_anchor = "    groupChild: function (node, info, groups, level) {\n        let me = this;\n\n"
+    if group_child_anchor not in content:
+        die(
+            "Could not find the expected groupChild() function signature in the target file. "
+            "Proxmox version may differ from what this tool was built against (tested on pve-manager 9.2.11). "
+            "Aborting without changes."
+        )
+
+    categories_cfg = load_config()
+    warn_unknown_vmids(categories_cfg)
+    category_block = generate_category_block(categories_cfg)
+    group_child_hook = generate_group_child_hook()
+
+    replacement = (
+        group_child_anchor
+        + category_block
+        + "\n\n"
+        + group_child_hook
+        + "\n"
+    )
+    new_content = content.replace(group_child_anchor, replacement, 1)
+
+    # --- Anchor 2: nodeSortFn ---
+    sort_anchor = "    nodeSortFn: function (node1, node2) {\n        let me = this;\n        let n1 = node1.data,\n            n2 = node2.data;\n\n"
+    if sort_anchor not in new_content:
+        die(
+            "Could not find the expected nodeSortFn() function signature. "
+            "Aborting WITHOUT writing any changes to disk (in-memory only so far)."
+        )
+
+    sort_hook = generate_sort_hook()
+    sort_replacement = sort_anchor + sort_hook + "\n\n"
+    new_content = new_content.replace(sort_anchor, sort_replacement, 1)
+
+    # --- Anchor 3: selModel listeners block — insert a new 'beforeselect'
+    #     listener right before 'selectionchange', as a sibling entry in the
+    #     same `listeners: { ... }` object. This blocks selection of
+    #     custom-category nodes entirely, so selectionchange never even fires
+    #     for them (no state gets saved, no setContent() gets called). ---
+    select_anchor = "                    selectionchange: function (sm, selected) {\n"
+    if select_anchor not in new_content:
+        die(
+            "Could not find the expected selectionchange listener in the target file. "
+            "Proxmox version may differ from what this tool was built against (tested on pve-manager 9.2.11). "
+            "Aborting WITHOUT writing any changes to disk (in-memory only so far)."
+        )
+
+    select_guard = generate_select_guard()
+    # Indent to match the listeners block (20 spaces, same level as 'selectionchange:')
+    indented_guard = "\n".join(
+        ("                    " + line if line.strip() else line)
+        for line in select_guard.splitlines()
+    )
+    select_replacement = indented_guard + "\n" + select_anchor
+    new_content = new_content.replace(select_anchor, select_replacement, 1)
+
+    tmp_path = os.path.join("/tmp", f"pve-category-tmp-{os.getpid()}.js")
+    write_file(tmp_path, new_content)
+
+    ok, err = node_check(tmp_path)
+    if not ok:
+        os.remove(tmp_path)
+        die(f"Generated file failed syntax validation (node --check):\n{err}\nNo changes written.")
+
+    shutil.move(tmp_path, TARGET)
+    info("Hooks installed successfully.")
+    restart_ok = restart_pveproxy()
+    info("Done. Edit /root/pve-ui-categories.json and run 'pve-category apply' for future changes.")
+    if not restart_ok:
+        sys.exit(2)
+
+
+# ---------------------------------------------------------------------------
+# Apply (regenerate category block only)
+# ---------------------------------------------------------------------------
+
+def cmd_apply():
+    if not os.path.exists(TARGET):
+        die(f"Target file not found: {TARGET}")
+
+    content = read_file(TARGET)
+
+    if BEGIN_CATEGORY_MARKER not in content or END_CATEGORY_MARKER not in content:
+        die(
+            "Category markers not found in the target file. "
+            "Run 'pve-category install' first (one-time setup)."
+        )
+
+    categories = load_config()
+    warn_unknown_vmids(categories)
+    new_block = generate_category_block(categories)
+
+    pattern = re.compile(
+        re.escape(BEGIN_CATEGORY_MARKER) + r".*?" + re.escape(END_CATEGORY_MARKER),
+        re.DOTALL,
+    )
+    if not pattern.search(content):
+        die("Could not isolate the existing category block between markers. Aborting.")
+
+    new_content = pattern.sub(lambda _m: new_block, content, count=1)
+
+    if new_content == content:
+        info("No changes detected between config and current file. Nothing to do.")
+        return
+
+    backup_path = backup_current("before-apply")
+
+    tmp_path = os.path.join("/tmp", f"pve-category-tmp-{os.getpid()}.js")
+    write_file(tmp_path, new_content)
+
+    ok, err = node_check(tmp_path)
+    if not ok:
+        os.remove(tmp_path)
+        die(
+            f"Generated file failed syntax validation (node --check):\n{err}\n"
+            f"Target file was NOT modified. Your previous backup is at: {backup_path}"
+        )
+
+    shutil.move(tmp_path, TARGET)
+    info("Category block updated successfully.")
+
+    def describe(c):
+        bits = []
+        if c.get("ids"):
+            bits.append(f"{len(c['ids'])} explicit")
+        if c.get("ranges"):
+            bits.append(f"{len(c['ranges'])} range(s)")
+        return f"{c['name']} ({', '.join(bits)})"
+
+    names = ", ".join(describe(c) for c in sorted(categories, key=lambda c: c["order"]))
+    info(f"Active categories: {names}")
+
+    if not restart_pveproxy():
+        sys.exit(2)
+
+
+# ---------------------------------------------------------------------------
+# Status
+# ---------------------------------------------------------------------------
+
+def cmd_status():
+    if not os.path.exists(TARGET):
+        die(f"Target file not found: {TARGET}")
+
+    content = read_file(TARGET)
+
+    if BEGIN_CATEGORY_MARKER not in content:
+        info("Hooks are NOT installed. Run 'pve-category install' first.")
+        return
+
+    pattern = re.compile(
+        re.escape(BEGIN_CATEGORY_MARKER) + r"(.*?)" + re.escape(END_CATEGORY_MARKER),
+        re.DOTALL,
+    )
+    m = pattern.search(content)
+    if not m:
+        info("Hooks marker found but block looks corrupted. Consider 'pve-category apply' to regenerate, or 'pve-category rollback'.")
+        return
+
+    info("Hooks installed. Current live category block:\n")
+    print(m.group(0))
+
+    if os.path.exists(CONFIG):
+        try:
+            categories = load_config()
+            info("\nConfig file categories (source of truth for next 'apply'):")
+            for c in sorted(categories, key=lambda c: c["order"]):
+                bits = []
+                if c.get("ids"):
+                    bits.append(f"ids={c['ids']}")
+                if c.get("ranges"):
+                    bits.append(f"ranges={c['ranges']}")
+                print(f"  [{c['order']}] {c['name']}: {', '.join(bits)}")
+        except SystemExit:
+            info(f"\nWARNING: {CONFIG} currently has validation errors — see above.")
+
+
+# ---------------------------------------------------------------------------
+# Ensure (idempotent re-install — safe to call from an apt hook)
+# ---------------------------------------------------------------------------
+
+def cmd_ensure():
+    """Re-establish hooks after pve-manager was reinstalled/upgraded and
+    overwrote pvemanagerlib.js with a stock copy, wiping the hooks.
+
+    Unlike 'install', this is idempotent and never dies with a non-zero exit
+    for conditions that are actually fine — it's designed to be called
+    unconditionally from an apt Post-Invoke hook, where a stray non-zero exit
+    would make dpkg/apt report the *package* transaction as failed even
+    though only our hook script had an issue.
+
+    Logic:
+      - pve-category was never set up on this host (no config, no pristine
+        backup) -> nothing to do, exit 0 silently.
+      - Hooks are already present and markers are intact -> nothing to do,
+        exit 0 silently.
+      - Config exists but hooks are missing (the overwrite case) -> run the
+        same steps 'install' does, but without the "already present" guard
+        blocking us, and without dying if pveproxy restart has hiccups
+        (still reported, but not treated as this command's failure).
+    """
+    never_configured = not os.path.exists(CONFIG) and not os.path.exists(PRISTINE_BACKUP)
+    if never_configured:
+        info("ensure: pve-category has never been set up on this host — nothing to do.")
+        return
+
+    if not os.path.exists(TARGET):
+        info(f"ensure: WARNING: target file not found ({TARGET}) — skipping, nothing to do.")
+        return
+
+    content = read_file(TARGET)
+    hooks_present = (
+        BEGIN_HOOK_MARKER in content
+        and BEGIN_SORT_MARKER in content
+        and BEGIN_SELECT_MARKER in content
+        and BEGIN_CATEGORY_MARKER in content
+    )
+    if hooks_present:
+        info("ensure: hooks already present — nothing to do.")
+        return
+
+    info("ensure: hooks are missing (likely wiped by a pve-manager package update) — reinstalling.")
+
+    if not os.path.exists(CONFIG):
+        info(
+            f"ensure: WARNING: hooks are missing AND config file not found ({CONFIG}). "
+            "Cannot reinstall without a config. Run 'pve-category install' manually once "
+            "you have a config in place."
+        )
+        return
+
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    if not os.path.exists(PRISTINE_BACKUP):
+        shutil.copy2(TARGET, PRISTINE_BACKUP)
+        info(f"ensure: pristine (pre-install) backup saved: {PRISTINE_BACKUP}")
+
+    backup_current("before-ensure")
+
+    group_child_anchor = "    groupChild: function (node, info, groups, level) {\n        let me = this;\n\n"
+    if group_child_anchor not in content:
+        info(
+            "ensure: WARNING: could not find the expected groupChild() signature. "
+            "pve-manager's internal code likely changed shape in this update — the "
+            "pve-category script needs its anchors updated for this version. "
+            "Leaving the file as-is (stock, no hooks)."
+        )
+        return
+
+    categories_cfg = load_config()
+    warn_unknown_vmids(categories_cfg)
+    category_block = generate_category_block(categories_cfg)
+    group_child_hook = generate_group_child_hook()
+
+    replacement = group_child_anchor + category_block + "\n\n" + group_child_hook + "\n"
+    new_content = content.replace(group_child_anchor, replacement, 1)
+
+    sort_anchor = "    nodeSortFn: function (node1, node2) {\n        let me = this;\n        let n1 = node1.data,\n            n2 = node2.data;\n\n"
+    if sort_anchor not in new_content:
+        info(
+            "ensure: WARNING: could not find the expected nodeSortFn() signature. "
+            "Aborting without writing any changes to disk."
+        )
+        return
+    sort_hook = generate_sort_hook()
+    new_content = new_content.replace(sort_anchor, sort_anchor + sort_hook + "\n\n", 1)
+
+    select_anchor = "                    selectionchange: function (sm, selected) {\n"
+    if select_anchor not in new_content:
+        info(
+            "ensure: WARNING: could not find the expected selectionchange listener. "
+            "Aborting without writing any changes to disk."
+        )
+        return
+    select_guard = generate_select_guard()
+    indented_guard = "\n".join(
+        ("                    " + line if line.strip() else line)
+        for line in select_guard.splitlines()
+    )
+    new_content = new_content.replace(select_anchor, indented_guard + "\n" + select_anchor, 1)
+
+    tmp_path = os.path.join("/tmp", f"pve-category-tmp-{os.getpid()}.js")
+    write_file(tmp_path, new_content)
+
+    ok, err = node_check(tmp_path)
+    if not ok:
+        os.remove(tmp_path)
+        info(f"ensure: WARNING: generated file failed syntax validation (node --check):\n{err}\nNo changes written.")
+        return
+
+    shutil.move(tmp_path, TARGET)
+    info("ensure: hooks reinstalled successfully.")
+    restart_pveproxy()  # best-effort — don't fail this command over a restart hiccup
+
+
+# ---------------------------------------------------------------------------
+# Rollback
+# ---------------------------------------------------------------------------
+
+def cmd_rollback():
+    if not os.path.exists(PRISTINE_BACKUP):
+        die(
+            f"No pristine backup found at {PRISTINE_BACKUP}. "
+            "Cannot safely auto-rollback to pre-install state. "
+            f"Check {BACKUP_DIR}/ manually and restore by hand if needed."
+        )
+
+    backup_current("before-rollback")
+    shutil.copy2(PRISTINE_BACKUP, TARGET)
+
+    ok, err = node_check(TARGET)
+    if not ok:
+        die(f"Restored file failed syntax check unexpectedly: {err}\nSomething is very wrong — investigate manually.")
+
+    info(f"Restored {TARGET} to pristine pre-install state.")
+    if not restart_pveproxy():
+        sys.exit(2)
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    if len(sys.argv) != 2 or sys.argv[1] not in ("install", "apply", "status", "rollback", "ensure"):
+        print(__doc__)
+        sys.exit(1)
+
+    if os.geteuid() != 0:
+        die("This script must be run as root (it edits Proxmox system files).")
+
+    cmd = sys.argv[1]
+    if cmd == "install":
+        cmd_install()
+    elif cmd == "apply":
+        cmd_apply()
+    elif cmd == "status":
+        cmd_status()
+    elif cmd == "rollback":
+        cmd_rollback()
+    elif cmd == "ensure":
+        cmd_ensure()
+
+
+if __name__ == "__main__":
+    main()
