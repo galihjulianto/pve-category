@@ -1,0 +1,10 @@
+# Force LF line endings for scripts that run on Linux (Proxmox), regardless
+# of what OS they're committed from. Prevents CRLF corruption breaking
+# shebangs / shell execution on the target server.
+pve-category            text eol=lf
+install.sh              text eol=lf
+*.sh                     text eol=lf
+apt-hook/*               text eol=lf
+config/*.json            text eol=lf
+README.md                text eol=lf
+.gitignore                text eol=lf
