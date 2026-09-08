@@ -64,27 +64,41 @@ pve-category status                  # confirms hooks are active
 
 `/root/pve-ui-categories.json`:
 
+Simple example, using only ID ranges:
+
 ```json
 {
-  "main services": {
-    "order": 1,
-    "icon": "fa fa-server",
-    "ids": [],
-    "ranges": [[100, 199]]
-  },
-  "experimental": {
-    "order": 6,
-    "icon": "fa fa-flask",
-    "ids": [101, 250],
-    "ranges": [[900, 999]]
-  }
+  "categories": [
+    { "name": "main services",  "order": 1, "icon": "fa fa-server",     "ranges": [[100, 199]] },
+    { "name": "infrastructure", "order": 2, "icon": "fa fa-sitemap",    "ranges": [[200, 299]] },
+    { "name": "monitoring",     "order": 3, "icon": "fa fa-area-chart", "ranges": [[300, 399]] },
+    { "name": "development",    "order": 4, "icon": "fa fa-code",       "ranges": [[400, 499]] },
+    { "name": "database",       "order": 5, "icon": "fa fa-database",  "ranges": [[500, 599]] },
+    { "name": "experimental",   "order": 6, "icon": "fa fa-flask",     "ranges": [[900, 999]] }
+  ]
 }
 ```
 
 - `order` — display order in the tree.
 - `icon` — a Font Awesome class string.
 - `ranges` — inclusive `[start, end]` VMID ranges assigned to this category.
-- `ids` — specific VMIDs to include outside of any range.
+
+`ids` is an optional field for pulling in specific VMIDs that fall outside
+any range — useful if you have a stray VM/CT (say, ID 101) that logically
+belongs in a category but wasn't given an ID inside that category's range.
+It can be used on its own, or alongside `ranges` in the same category:
+
+```json
+{
+  "categories": [
+    { "name": "main services", "order": 1, "icon": "fa fa-server", "ranges": [[100, 199]] },
+    { "name": "experimental",  "order": 6, "icon": "fa fa-flask",  "ranges": [[900, 999]], "ids": [101, 250] }
+  ]
+}
+```
+
+Here, "experimental" includes everything in 900-999, plus VMIDs 101 and 250
+specifically — even though those two don't fall in that range.
 
 If the same VMID matches more than one category, `apply`/`install` will
 report the overlap.
@@ -129,7 +143,7 @@ automatic reinstallation after package upgrades via an apt hook.
 
 ## License
 
-MIT
+[MIT](LICENSE)
 
 ## Disclaimer
 
