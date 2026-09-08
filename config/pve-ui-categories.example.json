@@ -5,6 +5,6 @@
     { "name": "monitoring",     "order": 3, "icon": "fa fa-area-chart", "ranges": [[300, 399]] },
     { "name": "development",    "order": 4, "icon": "fa fa-code",      "ranges": [[400, 499]] },
     { "name": "database",       "order": 5, "icon": "fa fa-database",  "ranges": [[500, 599]] },
-    { "name": "experimental",   "order": 6, "icon": "fa fa-flask",     "ids": [101, 250], "ranges": [[900, 999]] }
+    { "name": "experimental",   "order": 6, "icon": "fa fa-flask",     "ranges": [[900, 999]] }
   ]
 }
